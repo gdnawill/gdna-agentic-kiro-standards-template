@@ -1,0 +1,131 @@
+name: Publish to Peregrine
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (without v prefix)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    name: Package & Publish to Peregrine
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read project manifest
+        id: manifest
+        run: |
+          if [ ! -f peregrine.json ]; then
+            echo "::error::peregrine.json not found"
+            exit 1
+          fi
+          echo "product-id=$(jq -r '.productId' peregrine.json)" >> $GITHUB_OUTPUT
+          echo "project-type=$(jq -r '.projectType' peregrine.json)" >> $GITHUB_OUTPUT
+          echo "slug=$(jq -r '.slug' peregrine.json)" >> $GITHUB_OUTPUT
+          echo "artifact-path=$(jq -r '.artifactPath // "dist"' peregrine.json)" >> $GITHUB_OUTPUT
+          echo "domain=$(jq -r '.domain // "gdna.io"' peregrine.json)" >> $GITHUB_OUTPUT
+          VERSION="${{ inputs.version || github.ref_name }}"
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::730335467631:role/AIDLC-CatalogPublisher
+          aws-region: us-east-1
+
+      - name: Package artifact
+        id: package
+        run: |
+          VERSION="${{ steps.manifest.outputs.version }}"
+          PRODUCT="${{ steps.manifest.outputs.product-id }}"
+          TYPE="${{ steps.manifest.outputs.project-type }}"
+          ARTIFACT_PATH="${{ steps.manifest.outputs.artifact-path }}"
+
+          case "${TYPE}" in
+            landing-page)  ZIP_NAME="landing-dist.zip" ;;
+            demo)          ZIP_NAME="demo-bundle.zip" ;;
+            onboarding)    ZIP_NAME="onboarding-dist.zip" ;;
+            saas-app)      ZIP_NAME="frontend-dist.zip" ;;
+            *)             echo "::error::Unknown project type: ${TYPE}"; exit 1 ;;
+          esac
+
+          [ ! -d "${ARTIFACT_PATH}" ] && echo "::error::${ARTIFACT_PATH} not found" && exit 1
+
+          cd "${ARTIFACT_PATH}"
+          zip -r "/tmp/${ZIP_NAME}" . -x ".DS_Store" "*.bak" ".git/*" "node_modules/*" ".env" ".env.*" "__pycache__/*"
+          cd -
+
+          cat > /tmp/manifest.json << EOF
+          {
+            "productId": "${PRODUCT}",
+            "version": "${VERSION}",
+            "projectType": "${TYPE}",
+            "slug": "${{ steps.manifest.outputs.slug }}",
+            "domain": "${{ steps.manifest.outputs.domain }}",
+            "artifact": "${ZIP_NAME}",
+            "publishedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "publishedBy": "github-actions",
+            "repository": "${GITHUB_REPOSITORY}",
+            "commitSha": "${GITHUB_SHA}"
+          }
+          EOF
+
+          S3_PREFIX="s3://peregrine-templates-dev/products/${PRODUCT}/${VERSION}"
+          aws s3 cp "/tmp/${ZIP_NAME}" "${S3_PREFIX}/${ZIP_NAME}" --no-cli-pager
+          aws s3 cp /tmp/manifest.json "${S3_PREFIX}/manifest.json" --no-cli-pager
+          echo "zip-name=${ZIP_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Register version in Peregrine
+        run: |
+          VERSION="${{ steps.manifest.outputs.version }}"
+          PRODUCT="${{ steps.manifest.outputs.product-id }}"
+          TYPE="${{ steps.manifest.outputs.project-type }}"
+          SLUG="${{ steps.manifest.outputs.slug }}"
+          curl -sf -X POST \
+            "https://k6wq9xbvc8.execute-api.us-east-1.amazonaws.com/dev/ops/products/${PRODUCT}/versions" \
+            -H "Content-Type: application/json" \
+            -d "{\"version\":\"${VERSION}\",\"description\":\"${PRODUCT} v${VERSION}\",\"projectType\":\"${TYPE}\",\"slug\":\"${SLUG}\",\"repository\":\"${GITHUB_REPOSITORY}\",\"commitSha\":\"${GITHUB_SHA}\"}" \
+            --no-progress-meter || true
+
+      - name: Promote and deploy
+        run: |
+          VERSION="${{ steps.manifest.outputs.version }}"
+          PRODUCT="${{ steps.manifest.outputs.product-id }}"
+          TYPE="${{ steps.manifest.outputs.project-type }}"
+          SLUG="${{ steps.manifest.outputs.slug }}"
+          API="https://k6wq9xbvc8.execute-api.us-east-1.amazonaws.com/dev"
+
+          curl -sf -X PUT "${API}/ops/products/${PRODUCT}/versions/${VERSION}" \
+            -H "Content-Type: application/json" -d '{"status":"current"}' --no-progress-meter || true
+
+          case "${TYPE}" in
+            landing-page)
+              curl -sf -X POST "${API}/ops/landing-pages/${SLUG}/deploy" \
+                -H "Content-Type: application/json" \
+                -d "{\"source\":\"products/${PRODUCT}/${VERSION}/landing-dist.zip\",\"version\":\"${VERSION}\",\"deployedBy\":\"github-actions\"}" \
+                --no-progress-meter || echo "Deploy failed - register landing page in Peregrine first"
+              ;;
+            demo) echo "Demo artifacts staged at products/${PRODUCT}/${VERSION}/" ;;
+            onboarding) echo "Onboarding artifacts staged at products/${PRODUCT}/${VERSION}/" ;;
+            saas-app) echo "SaaS artifacts staged - deploy via product-update API" ;;
+          esac
+
+      - name: Summary
+        run: |
+          echo "## Published to Peregrine" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Product | ${{ steps.manifest.outputs.product-id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ steps.manifest.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Type | ${{ steps.manifest.outputs.project-type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Slug | ${{ steps.manifest.outputs.slug }} |" >> $GITHUB_STEP_SUMMARY

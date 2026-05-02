@@ -1,0 +1,1 @@
+{"_comment":"AIDLC to Peregrine publish manifest. Customize per project.","productId":"CHANGE_ME","projectType":"landing-page","slug":"CHANGE_ME","domain":"gdna.io","artifactPath":"landing","_projectTypes":["landing-page -> landing/ -> landing-dist.zip","demo -> demo/ -> demo-bundle.zip","onboarding -> onboarding/ -> onboarding-dist.zip","saas-app -> dist/ -> frontend-dist.zip"]}
